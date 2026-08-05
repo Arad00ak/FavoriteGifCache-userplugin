@@ -1,4 +1,10 @@
 /*
+ * Vencord, a Discord client mod
+ * Copyright (c) 2026 Arad and contributors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
+/*
  * Desktop-only helpers (Node / Electron). Used when the user picks a folder
  * for the GIF cache instead of IndexedDB.
  */

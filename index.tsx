@@ -13,6 +13,7 @@ import definePlugin, { OptionType } from "@utils/types";
 import type { PluginNative } from "@utils/types";
 import { Menu, Toasts, useEffect, useState } from "@webpack/common";
 
+/** Soft size budget shown in settings and enforced on put / load (disk + catalog). */
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 /**
  * Hard cap on how much decoded media we keep in the renderer heap at once.
@@ -633,6 +634,12 @@ function createBackendForPath(
     }
     return createDefaultBackend();
 }
+
+/**
+ * GIF CDN host helpers.
+ * Tenor (media CDN) is sunsetting third-party use; Discord and others move to Klipy.
+ * We treat both as first-class and rewrite failed Tenor downloads to Klipy host candidates.
+ */
 
 /** Hosts / suffixes that count as Tenor media. */
 const TENOR_HOST_MARKERS = [
@@ -2357,9 +2364,10 @@ async function prefetchFavorites() {
 
 export default definePlugin({
     name: "FavoriteGifCache",
-    description: "Cache GIF picker favorites on disk so they load faster",
+    description: "Caches GIF picker favorites on disk so they load from local storage instead of re-downloading",
     authors: [{ name: "Arad", id: 825757055981846560n }],
     tags: ["GIF", "Media", "Performance"],
+    // ExtraContextMenusAPI (required Equicord API) wires gifPickerContextMenu
 
     settings,
 
