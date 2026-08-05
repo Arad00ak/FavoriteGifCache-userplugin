@@ -583,8 +583,6 @@ function createBackendForPath(
     return createDefaultBackend();
 }
 
-type { CacheEntry, CacheMeta, PutOptions, PutResult, StorageBackend };
-
 interface FavoriteGifCacheOptions extends CacheCoreOptions {
     backend?: StorageBackend;
     /**
@@ -1464,48 +1462,48 @@ const settingsHooks = {
 const settings = definePluginSettings({
     cacheUsage: {
         type: OptionType.COMPONENT,
-        description: "Cache usage and actions",
+        description: "Storage",
         component: () => (usageComponent ? usageComponent() : null),
     },
     maxEntries: {
         type: OptionType.NUMBER,
-        description: "How many favorite GIFs to keep on disk (default 500)",
+        description: "Max number of GIFs to save",
         default: DEFAULT_MAX_ENTRIES,
         onChange: () => settingsHooks.onLimitsChange(),
     },
     maxMegabytes: {
         type: OptionType.NUMBER,
-        description: "Max total cache size in MB (default 500)",
+        description: "Max space the cache can use (MB)",
         default: 500,
         onChange: () => settingsHooks.onLimitsChange(),
     },
     skipLargeFiles: {
         type: OptionType.BOOLEAN,
-        description: "Skip files over 12 MB",
+        description: "Don't save files bigger than 12 MB",
         default: true,
     },
-    // Path is only set via Choose folder button — keep store, hide text field
+    // set via Choose folder button only
     cacheDirectory: {
         type: OptionType.STRING,
-        description: "Cache folder path",
+        description: "Cache folder",
         default: "",
         hidden: true,
         onChange: () => settingsHooks.onCacheDirectoryChange(),
     },
     smartEviction: {
         type: OptionType.BOOLEAN,
-        description: "When full, replace least-used GIFs for new favorites / sends. Off = never delete for new downloads",
+        description: "When full, delete least-used GIFs to make room",
         default: true,
         onChange: () => settingsHooks.onSmartEvictionChange(),
     },
     prefetchOnStart: {
         type: OptionType.BOOLEAN,
-        description: "On start, download newest favorites first until cache reaches 1/3 of max capacity",
+        description: "Download some favorites in the background after Discord starts",
         default: true,
     },
     rewriteFavoriteSrc: {
         type: OptionType.BOOLEAN,
-        description: "Point favorite thumbnails at local blob URLs when we have them cached",
+        description: "Load cached GIFs from disk instead of the internet",
         default: true,
     },
 });
@@ -1521,7 +1519,7 @@ function barColor(pct: number) {
     return "var(--brand-500, #5865f2)";
 }
 
-function toast(message: string, type: any) {
+function showToast(message: string, type: any) {
     try {
         Toasts.show({
             message,
@@ -1615,7 +1613,7 @@ function CacheUsageBar() {
                 const mb = cache.getMaxBytes();
                 setMaxBytes(Number.isFinite(mb) ? mb : DEFAULT_MAX_BYTES);
                 const dir = (settings.store.cacheDirectory || "").trim();
-                setPathLabel(dir || "IndexedDB (default)");
+                setPathLabel(dir || "Default (in Discord data)");
                 setReady(true);
             } catch {
                 if (alive) setReady(false);
@@ -1639,10 +1637,10 @@ function CacheUsageBar() {
         try {
             const cache = getActiveCache() ?? await rebuildActiveCache();
             await cache.clear();
-            toast("Favorite GIF cache cleared", Toasts.Type.SUCCESS);
+            showToast("Favorite GIF cache cleared", Toasts.Type.SUCCESS);
             setTick(t => t + 1);
         } catch {
-            toast("Failed to clear cache", Toasts.Type.FAILURE);
+            showToast("Failed to clear cache", Toasts.Type.FAILURE);
         } finally {
             setBusy(false);
         }
@@ -1651,7 +1649,7 @@ function CacheUsageBar() {
     const onBrowse = async () => {
         const native = getPluginNative();
         if (!native?.pickCacheDirectory) {
-            toast("Folder picker unavailable — restart Discord after updating", Toasts.Type.FAILURE);
+            showToast("Folder picker unavailable — restart Discord after updating", Toasts.Type.FAILURE);
             return;
         }
         setBusy(true);
@@ -1670,10 +1668,10 @@ function CacheUsageBar() {
             }
             settings.store.cacheDirectory = picked;
             await rebuildActiveCache();
-            toast("Cache folder updated", Toasts.Type.SUCCESS);
+            showToast("Cache folder updated", Toasts.Type.SUCCESS);
             setTick(t => t + 1);
         } catch (e) {
-            toast(e instanceof Error ? e.message : "Could not set folder", Toasts.Type.FAILURE);
+            showToast(e instanceof Error ? e.message : "Could not set folder", Toasts.Type.FAILURE);
         } finally {
             setBusy(false);
         }
@@ -1684,10 +1682,10 @@ function CacheUsageBar() {
         try {
             settings.store.cacheDirectory = "";
             await rebuildActiveCache();
-            toast("Using default storage", Toasts.Type.SUCCESS);
+            showToast("Using default storage", Toasts.Type.SUCCESS);
             setTick(t => t + 1);
         } catch {
-            toast("Failed to reset storage", Toasts.Type.FAILURE);
+            showToast("Failed to reset storage", Toasts.Type.FAILURE);
         } finally {
             setBusy(false);
         }
@@ -1708,7 +1706,7 @@ function CacheUsageBar() {
                 fontWeight: 600,
                 marginBottom: 4,
             }}>
-                Cache usage
+                Storage
             </div>
             <div style={{
                 marginBottom: 12,
@@ -1717,8 +1715,8 @@ function CacheUsageBar() {
                 lineHeight: "18px",
             }}>
                 {ready
-                    ? `${leftMB} MB free · snapshot when you open this page`
-                    : "Enable the plugin (or wait a moment) to load stats."}
+                    ? `${leftMB} MB free`
+                    : "Turn the plugin on to see usage."}
             </div>
 
             <UsageBar
