@@ -13,8 +13,6 @@ import definePlugin, { OptionType } from "@utils/types";
 import type { PluginNative } from "@utils/types";
 import { Menu, Toasts, useEffect, useState } from "@webpack/common";
 
-const DEFAULT_MAX_ENTRIES = 500;
-/** Soft size budget shown in settings and enforced with the entry cap. */
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 
 interface CacheMeta {
@@ -31,7 +29,6 @@ interface CacheEntry extends CacheMeta {
 }
 
 interface CacheCoreOptions {
-    maxEntries?: number;
     maxBytes?: number;
     now?: () => number;
 }
@@ -54,7 +51,6 @@ interface PutResult {
 
 class GifCacheCore {
     private readonly entries = new Map<string, CacheEntry>();
-    private maxEntries: number;
     private maxBytes: number;
     private totalBytes = 0;
     private readonly now: () => number;
@@ -62,18 +58,8 @@ class GifCacheCore {
     private protectedKeys = new Set<string>();
 
     constructor(options: CacheCoreOptions = {}) {
-        this.maxEntries = Math.max(1, options.maxEntries ?? DEFAULT_MAX_ENTRIES);
         this.maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
         this.now = options.now ?? (() => Date.now());
-    }
-
-    getMaxEntries() {
-        return this.maxEntries;
-    }
-
-    setMaxEntries(n: number) {
-        this.maxEntries = Math.max(1, n);
-        return this.enforceCap();
     }
 
     getMaxBytes() {
@@ -164,14 +150,7 @@ class GifCacheCore {
             return { stored: false, evictedKeys };
         }
 
-        const needsSlot = !existing;
-        const overCount = () => this.entries.size >= this.maxEntries && needsSlot
-            || (existing ? this.entries.size > this.maxEntries : this.entries.size >= this.maxEntries);
-        // after deleting existing, size is entries without this key
-        while (
-            (needsSlot && this.entries.size >= this.maxEntries)
-            || this.totalBytes + size > this.maxBytes
-        ) {
+        while (this.totalBytes + size > this.maxBytes) {
             if (!allowEvict) {
                 // put existing back if we stripped it for rewrite and can't finish
                 if (existing) {
@@ -187,10 +166,7 @@ class GifCacheCore {
             evictedKeys.push(victim.key);
         }
 
-        if (
-            (needsSlot && this.entries.size >= this.maxEntries)
-            || this.totalBytes + size > this.maxBytes
-        ) {
+        if (this.totalBytes + size > this.maxBytes) {
             if (existing) {
                 this.entries.set(existing.key, existing);
                 this.totalBytes += existing.size;
@@ -283,7 +259,7 @@ class GifCacheCore {
 
     private enforceCap(): string[] {
         const evicted: string[] = [];
-        while (this.entries.size > this.maxEntries || this.totalBytes > this.maxBytes) {
+        while (this.totalBytes > this.maxBytes) {
             const victim = this.pickVictim();
             if (!victim) break;
             this.entries.delete(victim.key);
@@ -635,9 +611,9 @@ class FavoriteGifCache {
                 const all = await this.backend.getAll();
                 for (const entry of all) this.core.loadEntry(entry);
 
-                // only trim if the user lowered the setting since last run
+                // only trim if the user lowered the size setting since last run
                 const before = new Set(this.core.keys());
-                const removed = this.core.setMaxEntries(this.core.getMaxEntries());
+                const removed = this.core.setMaxBytes(this.core.getMaxBytes());
                 const gone = removed.length
                     ? removed
                     : [...before].filter(k => !this.core.has(k));
@@ -651,23 +627,8 @@ class FavoriteGifCache {
         await this.ready;
     }
 
-    getMaxEntries() {
-        return this.core.getMaxEntries();
-    }
-
     getMaxBytes() {
         return this.core.getMaxBytes();
-    }
-
-    async setMaxEntries(n: number) {
-        await this.init();
-        const before = new Set(this.core.keys());
-        this.core.setMaxEntries(n);
-        const removed = [...before].filter(k => !this.core.has(k));
-        if (removed.length) {
-            await this.backend.deleteMany(removed);
-            for (const k of removed) this.revokeBlob(k);
-        }
     }
 
     async setMaxBytes(n: number) {
@@ -915,7 +876,6 @@ class FavoriteGifCache {
 
 function createFavoriteGifCache(options: FavoriteGifCacheOptions = {}) {
     return new FavoriteGifCache({
-        maxEntries: options.maxEntries ?? DEFAULT_MAX_ENTRIES,
         maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
         backend: options.backend,
         now: options.now,
@@ -995,10 +955,10 @@ function sortFavoritesNewestFirst(refs: FavoriteGifRef[]): FavoriteGifRef[] {
     });
 }
 
-/** How many entries startup prefetch should aim for: 1/3 of max capacity. */
-function prefetchTargetCount(maxEntries: number): number {
-    const max = Math.max(1, Math.floor(maxEntries));
-    return Math.max(1, Math.floor(max / 3));
+/** Startup prefetch byte budget: 1/3 of max cache size (at least 1 byte). */
+function prefetchTargetBytes(maxBytes: number): number {
+    if (!Number.isFinite(maxBytes) || maxBytes <= 0) return 0;
+    return Math.max(1, Math.floor(maxBytes / 3));
 }
 
 function cacheKeyForUrl(url: string) {
@@ -1465,12 +1425,6 @@ const settings = definePluginSettings({
         description: "Storage",
         component: () => (usageComponent ? usageComponent() : null),
     },
-    maxEntries: {
-        type: OptionType.NUMBER,
-        description: "Max number of GIFs to save",
-        default: DEFAULT_MAX_ENTRIES,
-        onChange: () => settingsHooks.onLimitsChange(),
-    },
     maxMegabytes: {
         type: OptionType.NUMBER,
         description: "Max space the cache can use (MB)",
@@ -1584,7 +1538,6 @@ function UsageBar(props: {
 function CacheUsageBar() {
     const [count, setCount] = useState(0);
     const [bytes, setBytes] = useState(0);
-    const [maxEntries, setMaxEntries] = useState(DEFAULT_MAX_ENTRIES);
     const [maxBytes, setMaxBytes] = useState(DEFAULT_MAX_BYTES);
     const [ready, setReady] = useState(false);
     const [busy, setBusy] = useState(false);
@@ -1609,7 +1562,6 @@ function CacheUsageBar() {
                 if (!alive) return;
                 setCount(cache.size());
                 setBytes(cache.bytes());
-                setMaxEntries(cache.getMaxEntries());
                 const mb = cache.getMaxBytes();
                 setMaxBytes(Number.isFinite(mb) ? mb : DEFAULT_MAX_BYTES);
                 const dir = (settings.store.cacheDirectory || "").trim();
@@ -1625,12 +1577,12 @@ function CacheUsageBar() {
         };
     }, [tick]);
 
-    const entryPct = maxEntries > 0 ? (count / maxEntries) * 100 : 0;
     const bytePct = maxBytes > 0 ? (bytes / maxBytes) * 100 : 0;
     const usedMB = formatMB(bytes);
     const maxMB = formatMB(maxBytes);
     const leftMB = formatMB(Math.max(0, maxBytes - bytes));
     const hasCustomPath = !!(settings.store.cacheDirectory || "").trim();
+    const gifLabel = count === 1 ? "1 GIF" : `${count} GIFs`;
 
     const onClear = async () => {
         setBusy(true);
@@ -1715,15 +1667,10 @@ function CacheUsageBar() {
                 lineHeight: "18px",
             }}>
                 {ready
-                    ? `${leftMB} MB free`
+                    ? `${gifLabel} · ${leftMB} MB free`
                     : "Turn the plugin on to see usage."}
             </div>
 
-            <UsageBar
-                label="GIFs"
-                valueText={`${count} / ${maxEntries}`}
-                percent={entryPct}
-            />
             <UsageBar
                 label="Size"
                 valueText={`${usedMB} MB / ${maxMB} MB`}
@@ -1800,7 +1747,6 @@ function createBackend() {
 function getCache() {
     if (!cache) {
         cache = createFavoriteGifCache({
-            maxEntries: settings.store.maxEntries || DEFAULT_MAX_ENTRIES,
             maxBytes: maxBytesFromSettings(),
             backend: createBackend(),
             smartEviction: settings.store.smartEviction !== false,
@@ -1826,8 +1772,6 @@ async function applyLimitsFromSettings() {
     try {
         const c = getCache();
         await c.init();
-        const max = Math.max(1, Number(settings.store.maxEntries) || DEFAULT_MAX_ENTRIES);
-        await c.setMaxEntries(max);
         await c.setMaxBytes(maxBytesFromSettings());
         c.setSmartEviction(settings.store.smartEviction !== false);
         c.warmAllBlobUrls();
@@ -2007,7 +1951,7 @@ async function manualRemoveFromCache(url: string) {
 
 /**
  * Startup auto-download:
- * newest favorite first, walk older, stop once cache size hits 1/3 of max capacity.
+ * newest favorite first, walk older, stop once cache bytes hit 1/3 of max size.
  * Never evicts during prefetch.
  */
 async function prefetchFavorites() {
@@ -2022,7 +1966,7 @@ async function prefetchFavorites() {
             refs = getFavoriteGifRefsFromFrecency();
         }
 
-        const target = prefetchTargetCount(c.getMaxEntries());
+        const targetBytes = prefetchTargetBytes(c.getMaxBytes());
         // already at / over 1/3 capacity — only warm blobs for newest slice
         const newest = sortFavoritesNewestFirst(refs);
         const queue: string[] = [];
@@ -2037,8 +1981,8 @@ async function prefetchFavorites() {
         }
         if (!queue.length) return;
 
-        if (c.size() >= target) {
-            for (const url of queue.slice(0, target)) {
+        if (c.bytes() >= targetBytes) {
+            for (const url of queue) {
                 c.ensureBlobUrlSync(cacheKeyForUrl(url), { bumpUsage: false });
             }
             return;
@@ -2046,7 +1990,7 @@ async function prefetchFavorites() {
 
         // Sequential newest→older so we fill 1/3 with the latest gifs, not random workers
         for (const url of queue) {
-            if (c.size() >= target) break;
+            if (c.bytes() >= targetBytes) break;
             try {
                 const key = cacheKeyForUrl(url);
                 if (c.has(key) || c.has(url)) {
@@ -2222,11 +2166,9 @@ export default definePlugin({
                         if (!u || isAutoCacheDenied(u)) continue;
                         const key = cacheKeyForUrl(u);
 
-                        // Scrolling: only fill free slots, never thrash-evict
+                        // Scrolling: fill free space only, never thrash-evict
                         if (!c.has(key) && !c.has(u)) {
-                            if (c.size() < c.getMaxEntries()) {
-                                await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
-                            }
+                            await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
                         }
 
                         const blob = c.ensureBlobUrlSync(key, { bumpUsage: false })
