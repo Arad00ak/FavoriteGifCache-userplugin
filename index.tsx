@@ -1,9 +1,9 @@
 /*
- * Vencord / Equicord userplugin - FavoriteGifCache
+ * Vencord / Equicord userplugin — FavoriteGifCache
  * Copyright (c) 2026 Arad and contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Source monorepo: https://github.com/Arad00ak/FavoriteGifCache
+ * Single-file install. Source: https://github.com/Arad00ak/FavoriteGifCache
  */
 
 import * as DataStore from "@api/DataStore";
@@ -14,7 +14,7 @@ import type { PluginNative } from "@utils/types";
 import { Menu, Toasts, useEffect, useState } from "@webpack/common";
 
 const DEFAULT_MAX_ENTRIES = 500;
-/** Max total cache size (bytes). */
+/** Soft size budget shown in settings and enforced with the entry cap. */
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 
 interface CacheMeta {
@@ -931,7 +931,7 @@ interface FavoriteGifRef {
     width?: number;
     height?: number;
     format?: number;
-    /** Discord favorite order - higher usually means newer / more recent. */
+    /** Discord favorite order — higher usually means newer / more recent. */
     order?: number;
 }
 
@@ -1146,7 +1146,7 @@ function getPluginNative(): Native | null {
 
         if (!helpers || typeof helpers !== "object") return null;
 
-        // Keyed by definePlugin({ name }) - see other plugins (OpenInApp, FileUpload, …)
+        // Keyed by definePlugin({ name }) — see other plugins (OpenInApp, FileUpload, …)
         const n =
             helpers.FavoriteGifCache
             ?? helpers.favoriteGifCache
@@ -1213,7 +1213,7 @@ async function downloadFavoriteMedia(
 
     try {
         const res = await fetchImpl(url, {
-            // omit cors mode - let Electron use default; strict cors often fails here
+            // omit cors mode — let Electron use default; strict cors often fails here
             credentials: "include",
             cache: "force-cache",
         } as RequestInit);
@@ -1231,16 +1231,12 @@ async function getCachedBytes(cache: FavoriteGifCache, url: string) {
     await cache.init();
     const key = cacheKeyForUrl(url);
 
-    
+    // peek first so miss path does not thrash metadata writes
     let entry = cache.peekSync(key);
     if (!entry && key !== url) entry = cache.peekSync(url);
 
     if (entry) {
-        
         cache.touchSync(entry.key);
-        if (isHeavyVideoMime(entry.mimeType) && entry.size > MAX_ENTRY_BYTES) {
-            return null;
-        }
         return { data: entry.data.slice(), mimeType: entry.mimeType, key: entry.key };
     }
 
@@ -1301,7 +1297,7 @@ async function ensureCached(
     const downloaded = await pending;
     if (!downloaded) return null;
 
-    
+    // Skip only truly huge videos; normal Tenor "gif" mp4s under the cap are OK
     if (downloaded.data.byteLength > maxBytes) {
         return null;
     }
@@ -1327,13 +1323,18 @@ async function cacheOnUserAction(
     cache: FavoriteGifCache,
     url: string,
     fetchImpl: typeof fetch = fetch,
-    opts: { force?: boolean; isDenied?: (url: string) => boolean; } = {},
+    opts: {
+        force?: boolean;
+        isDenied?: (url: string) => boolean;
+        maxBytes?: number;
+    } = {},
 ) {
     return ensureCached(cache, url, {
         fetchImpl,
         allowEvict: true,
         force: opts.force === true,
         isDenied: opts.isDenied,
+        maxBytes: opts.maxBytes,
     });
 }
 
@@ -1478,7 +1479,12 @@ const settings = definePluginSettings({
         default: 500,
         onChange: () => settingsHooks.onLimitsChange(),
     },
-    // Path is only set via Choose folder button - keep store, hide text field
+    skipLargeFiles: {
+        type: OptionType.BOOLEAN,
+        description: "Skip files over 12 MB",
+        default: true,
+    },
+    // Path is only set via Choose folder button — keep store, hide text field
     cacheDirectory: {
         type: OptionType.STRING,
         description: "Cache folder path",
@@ -1645,7 +1651,7 @@ function CacheUsageBar() {
     const onBrowse = async () => {
         const native = getPluginNative();
         if (!native?.pickCacheDirectory) {
-            toast("Folder picker unavailable - restart Discord after updating", Toasts.Type.FAILURE);
+            toast("Folder picker unavailable — restart Discord after updating", Toasts.Type.FAILURE);
             return;
         }
         setBusy(true);
@@ -1733,7 +1739,7 @@ function CacheUsageBar() {
                 wordBreak: "break-all",
             }}>
                 <span style={{ fontWeight: 600, color: "var(--header-secondary)" }}>Location: </span>
-                {pathLabel || "-"}
+                {pathLabel || "—"}
             </div>
 
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -1780,6 +1786,11 @@ function maxBytesFromSettings() {
     const mb = Number(settings.store.maxMegabytes);
     if (!Number.isFinite(mb) || mb <= 0) return DEFAULT_MAX_BYTES;
     return Math.floor(mb * 1024 * 1024);
+}
+
+/** Per-file download cap; Infinity when skipLargeFiles is off. */
+function perFileMaxBytes() {
+    return settings.store.skipLargeFiles === false ? Number.MAX_SAFE_INTEGER : MAX_ENTRY_BYTES;
 }
 
 function createBackend() {
@@ -1882,7 +1893,7 @@ function isTrackedFavorite(url: string) {
 
 function shouldCacheFavoriteUrl(url: string, _format?: number) {
     if (!url || url.startsWith("blob:") || url.startsWith("data:")) return false;
-    // Size filter happens at download time - don't block Tenor mp4 "gifs" by format alone
+    // Size filter happens at download time — don't block Tenor mp4 "gifs" by format alone
     return isCacheableFavoriteUrl(url) || isLikelyGifMediaUrl(url);
 }
 
@@ -1963,13 +1974,19 @@ function isLocallyCached(url: string) {
     }
 }
 
-const autoCacheOpts = () => ({ isDenied: isAutoCacheDenied });
+const autoCacheOpts = () => ({
+    isDenied: isAutoCacheDenied,
+    maxBytes: perFileMaxBytes(),
+});
 
 async function manualCacheGif(url: string) {
     await allowAutoCache(url);
     const c = getCache();
     await c.init();
-    const res = await cacheOnUserAction(c, url, fetch, { force: true });
+    const res = await cacheOnUserAction(c, url, fetch, {
+        force: true,
+        maxBytes: perFileMaxBytes(),
+    });
     if (res?.stored || c.has(cacheKeyForUrl(url))) {
         c.ensureBlobUrlSync(cacheKeyForUrl(url), { bumpUsage: true });
         toast("GIF cached", Toasts.Type.SUCCESS);
@@ -1986,7 +2003,7 @@ async function manualRemoveFromCache(url: string) {
     await c.delete(key);
     if (key !== url) await c.delete(url);
     await denyAutoCache(url);
-    toast("Removed from cache - won't auto-cache again", Toasts.Type.SUCCESS);
+    toast("Removed from cache — won't auto-cache again", Toasts.Type.SUCCESS);
     safeForceUpdate(lastPickerInstance);
 }
 
@@ -2001,14 +2018,14 @@ async function prefetchFavorites() {
         await c.init();
         refreshFavoriteSet();
         let refs = getFavoriteGifRefsFromFrecency();
-        // Frecency can be empty early in boot - retry once
+        // Frecency can be empty early in boot — retry once
         if (!refs.length) {
             await new Promise(r => setTimeout(r, 2000));
             refs = getFavoriteGifRefsFromFrecency();
         }
 
         const target = prefetchTargetCount(c.getMaxEntries());
-        // already at / over 1/3 capacity - only warm blobs for newest slice
+        // already at / over 1/3 capacity — only warm blobs for newest slice
         const newest = sortFavoritesNewestFirst(refs);
         const queue: string[] = [];
         const seen = new Set<string>();
@@ -2029,7 +2046,7 @@ async function prefetchFavorites() {
             return;
         }
 
-        
+        // Sequential newest→older so we fill 1/3 with the latest gifs, not random workers
         for (const url of queue) {
             if (c.size() >= target) break;
             try {
@@ -2047,7 +2064,7 @@ async function prefetchFavorites() {
         }
         c.warmAllBlobUrls();
     } catch {
-        
+        // never take discord down
     }
 }
 
@@ -2135,7 +2152,7 @@ export default definePlugin({
             });
             if (!remote) return;
             if (!isTrackedFavorite(remote) && !isTrackedFavorite(gif.url || "") && !isTrackedFavorite(gif.src || "")) {
-                
+                // still cache if it looks like a favorite media host from picker
                 if (!isLikelyGifMediaUrl(remote)) return;
             }
 
@@ -2188,8 +2205,8 @@ export default definePlugin({
                     c.warmAllBlobUrls();
                     let changed = applySyncBlobSrc(favorites, c) > 0;
 
-                    // new favorites can evict when full
-                    // (still skip mp4/video - those stay on the network)
+                    // Brand-new favorites may steal a slot from least-used when full
+                    // (still skip mp4/video — those stay on the network)
                     for (const u of newlyFavorited) {
                         const cacheUrl = pickCacheableUrl({ src: u, url: u });
                         if (!cacheUrl || isAutoCacheDenied(cacheUrl)) continue;
@@ -2207,7 +2224,7 @@ export default definePlugin({
                         if (!u || isAutoCacheDenied(u)) continue;
                         const key = cacheKeyForUrl(u);
 
-                        // scroll fill only if room
+                        // Scrolling: only fill free slots, never thrash-evict
                         if (!c.has(key) && !c.has(u)) {
                             if (c.size() < c.getMaxEntries()) {
                                 await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
@@ -2226,7 +2243,7 @@ export default definePlugin({
                                     if (!gif.__fgcOriginalSrc) gif.__fgcOriginalSrc = gif.src || orig;
                                     if (!gif.__fgcOriginalUrl && gif.url) gif.__fgcOriginalUrl = gif.url;
                                     gif.src = blob;
-                                    
+                                    // some builds read .url for the media element
                                     if (typeof gif.url === "string" && !gif.url.startsWith("blob:")) {
                                         gif.url = blob;
                                     }
@@ -2251,7 +2268,7 @@ export default definePlugin({
     async start() {
         try {
             await loadDenylist();
-            // loads IndexedDB from last session - does not wipe on restart
+            // loads IndexedDB from last session — does not wipe on restart
             await applyMaxFromSettings();
             refreshFavoriteSet();
             uninstallFetch = installFetchInterceptor(getCache(), isTrackedFavorite);
