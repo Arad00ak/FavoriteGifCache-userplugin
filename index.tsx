@@ -916,20 +916,8 @@ class FavoriteGifCache {
             return remoteUrl || null;
         }
 
-        const candidates = [remoteUrl];
-        try {
-            const u = new URL(remoteUrl);
-            if (
-                u.hostname.includes("tenor.com")
-                || u.hostname.includes("giphy.com")
-                || u.hostname.includes("discordapp")
-                || u.hostname.includes("discord.com")
-            ) {
-                candidates.unshift(`${u.origin}${u.pathname}`);
-            }
-        } catch {
-            // keep raw
-        }
+        // Tenor + Klipy rewrites so a favorite still shows if stored under either host
+        const candidates = mediaLookupKeys(remoteUrl);
 
         for (const key of candidates) {
             const hot = this.blobUrls.get(key);
@@ -1100,12 +1088,7 @@ function cacheKeyForUrl(url: string) {
     if (!url) return url;
     try {
         const u = new URL(url);
-        if (
-            u.hostname.includes("tenor.com")
-            || u.hostname.includes("giphy.com")
-            || u.hostname.includes("discordapp")
-            || u.hostname.includes("discord.com")
-        ) {
+        if (isGifProviderHost(u.hostname) || u.hostname.includes("discord.com")) {
             return `${u.origin}${u.pathname}`;
         }
         return u.href;
@@ -1117,12 +1100,10 @@ function cacheKeyForUrl(url: string) {
 function keysForFavorite(ref: FavoriteGifRef) {
     const keys = new Set<string>();
     if (ref.url) {
-        keys.add(cacheKeyForUrl(ref.url));
-        keys.add(ref.url);
+        for (const k of mediaLookupKeys(ref.url)) keys.add(k);
     }
     if (ref.src) {
-        keys.add(cacheKeyForUrl(ref.src));
-        keys.add(ref.src);
+        for (const k of mediaLookupKeys(ref.src)) keys.add(k);
     }
     return [...keys];
 }
@@ -1132,16 +1113,7 @@ function isLikelyGifMediaUrl(url: string) {
     if (url.startsWith("blob:") || url.startsWith("data:")) return false;
     try {
         const u = new URL(url);
-        const host = u.hostname;
-        if (
-            host.includes("tenor.com")
-            || host.includes("giphy.com")
-            || host.includes("media.discordapp")
-            || host.includes("cdn.discordapp")
-            || host.includes("discordapp.net")
-        ) {
-            return true;
-        }
+        if (isGifProviderHost(u.hostname)) return true;
         return /\.(gif|mp4|webm|webp|png|jpe?g)(\?|$)/i.test(u.pathname);
     } catch {
         return false;
@@ -1150,7 +1122,7 @@ function isLikelyGifMediaUrl(url: string) {
 
 /**
  * URL looks like an explicit video file.
- * Small Tenor mp4 "gifs" may still be cached if under the per-file size cap in media.ts.
+ * Small Tenor/Klipy mp4 "gifs" may still be cached if under the per-file size cap in media.ts.
  */
 function isHeavyVideoUrl(url: string) {
     if (!url || typeof url !== "string") return false;
@@ -1276,13 +1248,12 @@ function guessMime(url: string, contentType: string | null) {
 }
 
 /**
- * Pull bytes for a favorite media URL.
- * Prefers native (main process) so Discord renderer CORS cannot block Tenor/CDN.
+ * Try a single media URL once (native preferred, then optional renderer fetch).
  */
-async function downloadFavoriteMedia(
+async function downloadOneUrl(
     url: string,
-    fetchImpl: typeof fetch = fetch,
-    maxBytes = MAX_ENTRY_BYTES,
+    fetchImpl: typeof fetch,
+    maxBytes: number,
 ): Promise<{ data: Uint8Array; mime: string; } | null> {
     const native = getPluginNative();
     if (native && typeof (native as any).fetchMedia === "function") {
@@ -1300,14 +1271,12 @@ async function downloadFavoriteMedia(
                 }
             }
         } catch {
-            // fall through to renderer fetch
+            // try next strategy / candidate
         }
+        // native available but this URL failed — try next candidate (e.g. Klipy fallback)
+        // still allow renderer only when no native at all (below)
+        return null;
     }
-
-    // Renderer fallback: credentials "include" causes CORS storms and can tank Discord.
-    // Prefer omit; if native already exists and failed, skip fallback entirely.
-    const nativeAvailable = !!(native && typeof (native as any).fetchMedia === "function");
-    if (nativeAvailable) return null;
 
     try {
         const res = await fetchImpl(url, {
@@ -1325,17 +1294,38 @@ async function downloadFavoriteMedia(
     }
 }
 
+/**
+ * Pull bytes for a favorite media URL.
+ * Prefers native (main process). On Tenor failure, tries Klipy host-swap candidates.
+ */
+async function downloadFavoriteMedia(
+    url: string,
+    fetchImpl: typeof fetch = fetch,
+    maxBytes = MAX_ENTRY_BYTES,
+): Promise<{ data: Uint8Array; mime: string; fromUrl?: string; } | null> {
+    const candidates = mediaDownloadCandidates(url);
+    for (const candidate of candidates) {
+        const hit = await downloadOneUrl(candidate, fetchImpl, maxBytes);
+        if (hit) return { ...hit, fromUrl: candidate };
+    }
+    return null;
+}
+
 async function getCachedBytes(cache: FavoriteGifCache, url: string) {
     await cache.init();
-    const key = cacheKeyForUrl(url);
 
     // peek first so miss path does not thrash metadata writes
-    let entry = cache.peekSync(key);
-    if (!entry && key !== url) entry = cache.peekSync(url);
-
-    if (entry) {
-        cache.touchSync(entry.key);
-        return { data: entry.data.slice(), mimeType: entry.mimeType, key: entry.key };
+    // also check Klipy rewrites of Tenor so a fallback store still hits
+    for (const key of mediaLookupKeys(url)) {
+        if (!cache.has(key)) continue;
+        if (!cache.hasResidentData(key)) {
+            await cache.hydrate(key);
+        }
+        const entry = cache.peekSync(key);
+        if (entry && entry.data.byteLength > 0) {
+            cache.touchSync(entry.key);
+            return { data: entry.data.slice(), mimeType: entry.mimeType, key: entry.key };
+        }
     }
 
     return null;
@@ -1395,12 +1385,19 @@ async function ensureCached(
     const downloaded = await pending;
     if (!downloaded) return null;
 
-    // Skip only truly huge videos; normal Tenor "gif" mp4s under the cap are OK
+    // Skip only truly huge videos; normal Tenor/Klipy "gif" mp4s under the cap are OK
     if (downloaded.data.byteLength > maxBytes) {
         return null;
     }
 
+    // Always store under the original favorite key so Discord's Tenor URL still resolves
     await cache.put(key, downloaded.data, downloaded.mime, { allowEvict });
+
+    // Also index under the successful Klipy (or other) URL when fallback was used
+    const fromKey = downloaded.fromUrl ? cacheKeyForUrl(downloaded.fromUrl) : null;
+    if (fromKey && fromKey !== key) {
+        await cache.put(fromKey, downloaded.data, downloaded.mime, { allowEvict: false });
+    }
 
     let entry = cache.peekSync(key);
     if (!entry && allowEvict) {

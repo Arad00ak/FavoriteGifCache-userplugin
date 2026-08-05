@@ -57,9 +57,21 @@ export function getDefaultCacheDir() {
 
 /** Hosts we are willing to pull favorite media from (main process = no CORS). */
 const ALLOWED_MEDIA_HOSTS = [
+    // Tenor (legacy — may die; Klipy fallbacks tried in media.ts)
     "media.tenor.com",
     "tenor.com",
     "c.tenor.com",
+    // Klipy (Tenor replacement Discord / partners are moving to)
+    "media.klipy.com",
+    "cdn.klipy.com",
+    "static.klipy.com",
+    "gifs.klipy.com",
+    "i.klipy.com",
+    "media1.klipy.com",
+    "media2.klipy.com",
+    "c.klipy.com",
+    "klipy.com",
+    // Giphy
     "media.giphy.com",
     "media0.giphy.com",
     "media1.giphy.com",
@@ -67,6 +79,7 @@ const ALLOWED_MEDIA_HOSTS = [
     "media3.giphy.com",
     "media4.giphy.com",
     "i.giphy.com",
+    // Discord CDN / proxy
     "media.discordapp.net",
     "cdn.discordapp.com",
     "images-ext-1.discordapp.net",
@@ -79,6 +92,9 @@ const DEFAULT_MAX_DOWNLOAD = 12 * 1024 * 1024; // 12 MB
 
 function hostAllowed(hostname: string) {
     const h = hostname.toLowerCase();
+    if (h.includes("klipy.com") || h.includes("tenor.com") || h.includes("giphy.com")) {
+        return true;
+    }
     return ALLOWED_MEDIA_HOSTS.some(a => h === a || h.endsWith("." + a));
 }
 
