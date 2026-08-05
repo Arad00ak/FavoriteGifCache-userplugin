@@ -14,6 +14,12 @@ import type { PluginNative } from "@utils/types";
 import { Menu, Toasts, useEffect, useState } from "@webpack/common";
 
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
+/**
+ * Hard cap on how much decoded media we keep in the renderer heap at once.
+ * Disk can still hold up to maxBytes; cold entries unload payload and reload on demand.
+ * Without this, a full 500 MB catalog OOMs Discord.
+ */
+const SOFT_MEMORY_BYTES = 80 * 1024 * 1024;
 
 interface CacheMeta {
     key: string;
@@ -30,6 +36,8 @@ interface CacheEntry extends CacheMeta {
 
 interface CacheCoreOptions {
     maxBytes?: number;
+    /** In-heap payload budget (default SOFT_MEMORY_BYTES). */
+    softMemoryBytes?: number;
     now?: () => number;
 }
 
@@ -52,6 +60,7 @@ interface PutResult {
 class GifCacheCore {
     private readonly entries = new Map<string, CacheEntry>();
     private maxBytes: number;
+    private softMemoryBytes: number;
     private totalBytes = 0;
     private readonly now: () => number;
     /** Keys we try not to evict (usually still in Discord favorites). */
@@ -59,6 +68,7 @@ class GifCacheCore {
 
     constructor(options: CacheCoreOptions = {}) {
         this.maxBytes = options.maxBytes ?? Number.POSITIVE_INFINITY;
+        this.softMemoryBytes = options.softMemoryBytes ?? SOFT_MEMORY_BYTES;
         this.now = options.now ?? (() => Date.now());
     }
 
@@ -69,6 +79,10 @@ class GifCacheCore {
     setMaxBytes(n: number) {
         this.maxBytes = n > 0 ? n : Number.POSITIVE_INFINITY;
         return this.enforceCap();
+    }
+
+    getSoftMemoryBytes() {
+        return this.softMemoryBytes;
     }
 
     setProtectedKeys(keys: Iterable<string>) {
@@ -87,12 +101,30 @@ class GifCacheCore {
         return this.totalBytes;
     }
 
+    /** Bytes of payload currently resident in the renderer heap. */
+    residentBytes() {
+        let n = 0;
+        for (const e of this.entries.values()) n += e.data.byteLength;
+        return n;
+    }
+
     keys() {
         return [...this.entries.keys()];
     }
 
     has(key: string) {
         return this.entries.has(key);
+    }
+
+    /** True when the key is cataloged but payload was unloaded to free RAM. */
+    needsHydrate(key: string) {
+        const entry = this.entries.get(key);
+        return !!entry && entry.size > 0 && entry.data.byteLength === 0;
+    }
+
+    hasResidentData(key: string) {
+        const entry = this.entries.get(key);
+        return !!entry && entry.data.byteLength > 0;
     }
 
     get(key: string): CacheEntry | null {
@@ -187,6 +219,7 @@ class GifCacheCore {
 
         this.entries.set(key, entry);
         this.totalBytes += size;
+        this.ensureSoftMemory(key);
         return { stored: true, evictedKeys };
     }
 
@@ -213,10 +246,14 @@ class GifCacheCore {
             this.totalBytes -= prev.size;
             this.entries.delete(entry.key);
         }
+        // Prefer stored size when present so unloaded shells (data empty) still account disk usage
+        const size = payload.byteLength > 0
+            ? payload.byteLength
+            : (typeof entry.size === "number" && entry.size > 0 ? entry.size : payload.byteLength);
         const next: CacheEntry = {
             key: entry.key,
             data: payload,
-            size: payload.byteLength,
+            size,
             mimeType: entry.mimeType || "application/octet-stream",
             useCount: entry.useCount ?? 0,
             lastUsed: entry.lastUsed ?? this.now(),
@@ -224,6 +261,44 @@ class GifCacheCore {
         };
         this.entries.set(next.key, next);
         this.totalBytes += next.size;
+    }
+
+    /**
+     * Drop cold payloads from the heap until under softMemoryBytes.
+     * Catalog (size/meta) stays; disk copy is untouched. Returns unloaded keys.
+     */
+    ensureSoftMemory(keepKey?: string): string[] {
+        const unloaded: string[] = [];
+        while (this.residentBytes() > this.softMemoryBytes) {
+            const victim = this.pickDataVictim(keepKey);
+            if (!victim) break;
+            if (victim.data.byteLength === 0) break;
+            victim.data = new Uint8Array(0);
+            unloaded.push(victim.key);
+        }
+        return unloaded;
+    }
+
+    /** Prefer cold, unprotected, resident payloads for RAM unload (not full eviction). */
+    private pickDataVictim(exceptKey?: string): CacheEntry | null {
+        let bestUnprotected: CacheEntry | null = null;
+        let bestAny: CacheEntry | null = null;
+
+        for (const entry of this.entries.values()) {
+            if (exceptKey && entry.key === exceptKey) continue;
+            if (entry.data.byteLength === 0) continue;
+
+            if (!this.protectedKeys.has(entry.key)) {
+                if (!bestUnprotected || this.isWorse(entry, bestUnprotected)) {
+                    bestUnprotected = entry;
+                }
+            }
+            if (!bestAny || this.isWorse(entry, bestAny)) {
+                bestAny = entry;
+            }
+        }
+
+        return bestUnprotected ?? bestAny;
     }
 
     /**
@@ -619,12 +694,32 @@ class FavoriteGifCache {
                     : [...before].filter(k => !this.core.has(k));
                 if (gone.length) await this.backend.deleteMany(gone);
 
-                // rebuild blob: urls from disk so the picker can paint offline
-                this.warmAllBlobUrls();
+                // Drop cold payloads so a big disk cache cannot OOM Discord on boot.
+                // Do NOT warm every blob URL here — picker warms only what it shows.
+                for (const key of this.core.ensureSoftMemory()) this.revokeBlob(key);
+
                 this.initDone = true;
             })();
         }
         await this.ready;
+    }
+
+    /**
+     * Ensure payload bytes are in RAM (reload from disk if soft-unloaded).
+     * Returns false if missing entirely.
+     */
+    async hydrate(key: string): Promise<boolean> {
+        await this.init();
+        if (!this.core.has(key)) return false;
+        if (this.core.hasResidentData(key)) return true;
+
+        const fromDisk = await this.backend.get(key);
+        if (!fromDisk || fromDisk.data.byteLength === 0) return false;
+        this.core.loadEntry(fromDisk);
+        for (const k of this.core.ensureSoftMemory(key)) {
+            if (k !== key) this.revokeBlob(k);
+        }
+        return this.core.hasResidentData(key);
     }
 
     getMaxBytes() {
@@ -659,6 +754,10 @@ class FavoriteGifCache {
         return this.core.has(key);
     }
 
+    hasResidentData(key: string) {
+        return this.core.hasResidentData(key);
+    }
+
     keys() {
         return this.core.keys();
     }
@@ -669,14 +768,17 @@ class FavoriteGifCache {
 
     async get(key: string): Promise<CacheEntry | null> {
         await this.init();
+        if (this.core.needsHydrate(key)) await this.hydrate(key);
         const entry = this.core.get(key);
-        if (!entry) return null;
+        if (!entry || entry.data.byteLength === 0) return null;
+        // only rewrite disk when we have real payload (use stats)
         await this.backend.put(entry);
         return entry;
     }
 
     async peek(key: string) {
         await this.init();
+        if (this.core.needsHydrate(key)) await this.hydrate(key);
         return this.core.peek(key);
     }
 
@@ -716,10 +818,14 @@ class FavoriteGifCache {
 
         if (result.stored) {
             const stored = this.core.peek(key);
-            if (stored) {
+            if (stored && stored.data.byteLength > 0) {
                 await this.backend.put(stored);
                 this.revokeBlob(key);
                 this.ensureBlobUrlSync(key, { bumpUsage: false });
+            }
+            // Soft unload may have dropped other payloads — drop their blob URLs too
+            for (const k of [...this.blobUrls.keys()]) {
+                if (!this.core.hasResidentData(k)) this.revokeBlob(k);
             }
         }
 
@@ -775,8 +881,11 @@ class FavoriteGifCache {
             return existing;
         }
 
+        // Payload soft-unloaded — caller should hydrate async; do not mint empty blobs
+        if (this.core.needsHydrate(key)) return null;
+
         const entry = bump ? this.core.get(key) : this.core.peek(key);
-        if (!entry) return null;
+        if (!entry || entry.data.byteLength === 0) return null;
         if (bump) this.scheduleMetaPersist(entry);
 
         try {
@@ -788,6 +897,15 @@ class FavoriteGifCache {
         } catch {
             return null;
         }
+    }
+
+    /** Hydrate from disk if needed, then create blob URL. */
+    async ensureBlobUrl(key: string, opts: BlobUrlOptions = {}): Promise<string | null> {
+        await this.init();
+        if (this.core.needsHydrate(key)) {
+            await this.hydrate(key);
+        }
+        return this.ensureBlobUrlSync(key, opts);
     }
 
     resolveDisplayUrlSync(remoteUrl: string): string | null {
@@ -826,18 +944,22 @@ class FavoriteGifCache {
         return null;
     }
 
+    /**
+     * Create blob URLs for keys that already have resident data.
+     * Does not hydrate the entire cache (that would OOM). Pass only the visible set.
+     */
     warmAllBlobUrls(keys?: string[]) {
         const list = keys ?? this.core.keys();
         let n = 0;
         for (const key of list) {
+            if (!this.core.hasResidentData(key)) continue;
             if (this.ensureBlobUrlSync(key, { bumpUsage: false })) n += 1;
         }
         return n;
     }
 
     async getBlobUrl(key: string) {
-        await this.init();
-        return this.ensureBlobUrlSync(key, { bumpUsage: true });
+        return this.ensureBlobUrl(key, { bumpUsage: true });
     }
 
     getCachedBlobUrl(key: string) {
@@ -845,13 +967,16 @@ class FavoriteGifCache {
     }
 
     private scheduleMetaPersist(entry: CacheEntry) {
+        // Never persist a soft-unloaded shell (empty data) over the real disk bytes
+        if (entry.data.byteLength === 0 && entry.size > 0) return;
+
         const prev = this.metaPersistQueue.get(entry.key);
         if (prev) clearTimeout(prev);
 
         const t = setTimeout(() => {
             this.metaPersistQueue.delete(entry.key);
             const latest = this.core.peek(entry.key);
-            if (!latest) return;
+            if (!latest || (latest.data.byteLength === 0 && latest.size > 0)) return;
             void this.backend.put(latest).catch(() => {});
         }, 50);
         this.metaPersistQueue.set(entry.key, t);
@@ -877,6 +1002,7 @@ class FavoriteGifCache {
 function createFavoriteGifCache(options: FavoriteGifCacheOptions = {}) {
     return new FavoriteGifCache({
         maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
+        softMemoryBytes: options.softMemoryBytes ?? SOFT_MEMORY_BYTES,
         backend: options.backend,
         now: options.now,
         smartEviction: options.smartEviction,
@@ -955,10 +1081,18 @@ function sortFavoritesNewestFirst(refs: FavoriteGifRef[]): FavoriteGifRef[] {
     });
 }
 
-/** Startup prefetch byte budget: 1/3 of max cache size (at least 1 byte). */
+/** Hard cap for startup prefetch so boot never tries to pull ~1/3 of a 500 MB budget. */
+const PREFETCH_MAX_BYTES = 32 * 1024 * 1024;
+/** Max number of files startup prefetch will touch (disk can still grow via normal use). */
+const PREFETCH_MAX_FILES = 40;
+
+/**
+ * Startup prefetch byte budget: min(1/3 max size, PREFETCH_MAX_BYTES).
+ * Disk cap stays maxMegabytes; this only limits how aggressive boot fill is.
+ */
 function prefetchTargetBytes(maxBytes: number): number {
     if (!Number.isFinite(maxBytes) || maxBytes <= 0) return 0;
-    return Math.max(1, Math.floor(maxBytes / 3));
+    return Math.max(1, Math.min(PREFETCH_MAX_BYTES, Math.floor(maxBytes / 3)));
 }
 
 function cacheKeyForUrl(url: string) {
@@ -1169,11 +1303,16 @@ async function downloadFavoriteMedia(
         }
     }
 
+    // Renderer fallback: credentials "include" causes CORS storms and can tank Discord.
+    // Prefer omit; if native already exists and failed, skip fallback entirely.
+    const nativeAvailable = !!(native && typeof (native as any).fetchMedia === "function");
+    if (nativeAvailable) return null;
+
     try {
         const res = await fetchImpl(url, {
-            // omit cors mode — let Electron use default; strict cors often fails here
-            credentials: "include",
+            credentials: "omit",
             cache: "force-cache",
+            mode: "cors",
         } as RequestInit);
         if (!res.ok) return null;
         const mime = guessMime(url, res.headers.get("content-type"));
@@ -1798,7 +1937,7 @@ async function applyLimitsFromSettings() {
         await c.init();
         await c.setMaxBytes(maxBytesFromSettings());
         c.setSmartEviction(settings.store.smartEviction !== false);
-        c.warmAllBlobUrls();
+        // do not warm entire cache into RAM after settings change
     } catch {
         // settings UI should still work
     }
@@ -1853,7 +1992,9 @@ function refreshFavoriteSet(refs?: FavoriteGifRef[]): string[] {
 
 function isTrackedFavorite(url: string) {
     if (!url || !isLikelyGifMediaUrl(url)) return false;
-    if (favoriteUrlSet.size === 0) return isLikelyGifMediaUrl(url);
+    // Until favorites seed, do NOT treat every gif URL as favorite — that made
+    // the fetch interceptor + cache init run on every media request (crash fuel).
+    if (!favoritesSeeded || favoriteUrlSet.size === 0) return false;
     return favoriteUrlSet.has(url) || favoriteUrlSet.has(cacheKeyForUrl(url));
 }
 
@@ -1975,8 +2116,8 @@ async function manualRemoveFromCache(url: string) {
 
 /**
  * Startup auto-download:
- * newest favorite first, walk older, stop once cache bytes hit 1/3 of max size.
- * Never evicts during prefetch.
+ * newest favorite first, stop at prefetch byte/file caps (not full disk budget).
+ * Never evicts during prefetch. Never warms the whole cache into blob URLs.
  */
 async function prefetchFavorites() {
     try {
@@ -1991,11 +2132,11 @@ async function prefetchFavorites() {
         }
 
         const targetBytes = prefetchTargetBytes(c.getMaxBytes());
-        // already at / over 1/3 capacity — only warm blobs for newest slice
         const newest = sortFavoritesNewestFirst(refs);
         const queue: string[] = [];
         const seen = new Set<string>();
         for (const ref of newest) {
+            if (queue.length >= PREFETCH_MAX_FILES) break;
             const u = pickCacheableUrl(ref);
             if (!u) continue;
             const key = cacheKeyForUrl(u);
@@ -2005,30 +2146,29 @@ async function prefetchFavorites() {
         }
         if (!queue.length) return;
 
-        if (c.bytes() >= targetBytes) {
-            for (const url of queue) {
-                c.ensureBlobUrlSync(cacheKeyForUrl(url), { bumpUsage: false });
-            }
-            return;
-        }
+        // Measure progress by how much we add this session, not total disk size
+        // (disk may already be large from prior use — still fine, just don't fill RAM)
+        let sessionBytes = 0;
+        let filesDone = 0;
 
-        // Sequential newest→older so we fill 1/3 with the latest gifs, not random workers
         for (const url of queue) {
-            if (c.bytes() >= targetBytes) break;
+            if (sessionBytes >= targetBytes || filesDone >= PREFETCH_MAX_FILES) break;
             try {
                 const key = cacheKeyForUrl(url);
                 if (c.has(key) || c.has(url)) {
-                    c.ensureBlobUrlSync(key, { bumpUsage: false });
+                    await c.ensureBlobUrl(key, { bumpUsage: false });
+                    filesDone += 1;
                     continue;
                 }
+                const before = c.bytes();
                 await ensureCached(c, url, { allowEvict: false, ...autoCacheOpts() });
-                c.ensureBlobUrlSync(key, { bumpUsage: false });
-                if (key !== url) c.ensureBlobUrlSync(url, { bumpUsage: false });
+                sessionBytes += Math.max(0, c.bytes() - before);
+                await c.ensureBlobUrl(key, { bumpUsage: false });
+                filesDone += 1;
             } catch {
                 // skip bad urls
             }
         }
-        c.warmAllBlobUrls();
     } catch {
         // never take discord down
     }
@@ -2168,35 +2308,54 @@ export default definePlugin({
             void (async () => {
                 try {
                     await c.init();
-                    c.warmAllBlobUrls();
+                    // Only warm keys for THIS visible list — never the whole disk cache
+                    const visibleKeys: string[] = [];
+                    for (const ref of refs) {
+                        const u = pickCacheableUrl(ref);
+                        if (!u) continue;
+                        visibleKeys.push(cacheKeyForUrl(u));
+                    }
+                    // hydrate a few visible entries that are on disk but not in RAM
+                    let hydrateBudget = 12;
+                    for (const key of visibleKeys) {
+                        if (hydrateBudget <= 0) break;
+                        if (c.has(key) && !c.hasResidentData(key)) {
+                            await c.hydrate(key);
+                            hydrateBudget -= 1;
+                        }
+                    }
+                    c.warmAllBlobUrls(visibleKeys);
                     let changed = applySyncBlobSrc(favorites, c) > 0;
 
-                    // Brand-new favorites may steal a slot from least-used when full
-                    // (still skip mp4/video — those stay on the network)
+                    // Brand-new favorites may steal space from least-used when full
                     for (const u of newlyFavorited) {
                         const cacheUrl = pickCacheableUrl({ src: u, url: u });
                         if (!cacheUrl || isAutoCacheDenied(cacheUrl)) continue;
                         try {
                             await cacheOnUserAction(c, cacheUrl, fetch, autoCacheOpts());
                             const key = cacheKeyForUrl(cacheUrl);
-                            c.ensureBlobUrlSync(key, { bumpUsage: false });
+                            await c.ensureBlobUrl(key, { bumpUsage: false });
                         } catch {
                             // ignore single failures
                         }
                     }
+
+                    // Scroll fill: tiny budget so opening the picker cannot download 500MB
+                    let scrollDownloads = 0;
+                    const SCROLL_DOWNLOAD_BUDGET = 3;
 
                     for (const ref of refs) {
                         const u = pickCacheableUrl(ref);
                         if (!u || isAutoCacheDenied(u)) continue;
                         const key = cacheKeyForUrl(u);
 
-                        // Scrolling: fill free space only, never thrash-evict
-                        if (!c.has(key) && !c.has(u)) {
+                        if (!c.has(key) && !c.has(u) && scrollDownloads < SCROLL_DOWNLOAD_BUDGET) {
                             await ensureCached(c, u, { allowEvict: false, ...autoCacheOpts() });
+                            scrollDownloads += 1;
                         }
 
-                        const blob = c.ensureBlobUrlSync(key, { bumpUsage: false })
-                            || c.ensureBlobUrlSync(u, { bumpUsage: false });
+                        const blob = await c.ensureBlobUrl(key, { bumpUsage: false })
+                            || await c.ensureBlobUrl(u, { bumpUsage: false });
                         if (!blob) continue;
 
                         for (const gif of favorites) {
