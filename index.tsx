@@ -3,7 +3,7 @@
  * Copyright (c) 2026 Arad and contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Single-file install. Source: https://github.com/Arad00ak/FavoriteGifCache
+ * Single-file install. Source: https://github.com/Arad00ak/favoriteGifCache-source
  */
 
 import * as DataStore from "@api/DataStore";
