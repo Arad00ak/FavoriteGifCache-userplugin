@@ -62,9 +62,10 @@ const ALLOWED_MEDIA_HOSTS = [
     "tenor.com",
     "c.tenor.com",
     // Klipy (Tenor replacement Discord / partners are moving to)
+    "static.klipy.com",
+    "api.klipy.com",
     "media.klipy.com",
     "cdn.klipy.com",
-    "static.klipy.com",
     "gifs.klipy.com",
     "i.klipy.com",
     "media1.klipy.com",
