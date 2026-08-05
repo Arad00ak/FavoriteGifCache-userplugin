@@ -1419,6 +1419,27 @@ const settingsHooks = {
     onCacheDirectoryChange: () => {},
 };
 
+/** Removed options still lingering in saved settings.json from older builds. */
+const STALE_SETTING_KEYS = ["maxEntries", "showCacheBadges"] as const;
+
+/**
+ * Drop dead keys from Equicord/Vencord settings so they do not stick around forever.
+ * Safe to call multiple times.
+ */
+function purgeStalePluginSettings() {
+    try {
+        const plug = Settings.plugins?.FavoriteGifCache as Record<string, unknown> | undefined;
+        if (!plug || typeof plug !== "object") return;
+        for (const key of STALE_SETTING_KEYS) {
+            if (Object.prototype.hasOwnProperty.call(plug, key)) {
+                delete plug[key];
+            }
+        }
+    } catch {
+        // settings not ready yet
+    }
+}
+
 const settings = definePluginSettings({
     cacheUsage: {
         type: OptionType.COMPONENT,
@@ -1461,6 +1482,9 @@ const settings = definePluginSettings({
         default: true,
     },
 });
+
+// run as soon as the module loads (before start) so dead keys leave settings immediately
+purgeStalePluginSettings();
 
 function formatMB(bytes: number) {
     if (!Number.isFinite(bytes) || bytes < 0) return "0.0";
@@ -2207,6 +2231,8 @@ export default definePlugin({
 
     async start() {
         try {
+            // strip removed options (maxEntries, showCacheBadges, …) from saved settings
+            purgeStalePluginSettings();
             await loadDenylist();
             // loads IndexedDB from last session — does not wipe on restart
             await applyMaxFromSettings();
